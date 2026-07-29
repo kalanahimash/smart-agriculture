@@ -1,0 +1,15 @@
+apiVersion: 1
+
+datasources:
+  - name: InfluxDB - Smart Agriculture
+    type: influxdb
+    access: proxy
+    url: http://influxdb:8086
+    jsonData:
+      version: Flux
+      organization: smart-agriculture
+      defaultBucket: sensors
+      tlsSkipVerify: true
+    secureJsonData:
+      token: dev-token
+    isDefault: true

@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Env files
+.env
+*.env.local
+
+# Node / frontend
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# PlatformIO
+.pio/
+.vscode/
+
+# AI model weights (large binary files)
+ai/models/*.pt
+!ai/models/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

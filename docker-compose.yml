@@ -1,0 +1,110 @@
+version: "3.9"
+
+# Smart Agriculture Digital Twin - full stack
+# Run: docker compose up -d --build
+#
+# Services:
+#   mosquitto   - MQTT broker for sensor/command messaging
+#   influxdb    - time-series database for historical sensor data
+#   grafana     - dashboards/visualization on top of InfluxDB
+#   backend     - FastAPI server (REST + WebSocket)
+#   gateway     - RS485-to-MQTT bridge (mock mode by default; needs a
+#                 device mapping to /dev/ttyUSB0 for real hardware)
+#   dashboard   - React frontend served via Nginx
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: agri-mosquitto
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./docker/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto-data:/mosquitto/data
+      - mosquitto-log:/mosquitto/log
+
+  influxdb:
+    image: influxdb:2.7
+    container_name: agri-influxdb
+    restart: unless-stopped
+    ports:
+      - "8086:8086"
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: admin
+      DOCKER_INFLUXDB_INIT_PASSWORD: admin12345
+      DOCKER_INFLUXDB_INIT_ORG: smart-agriculture
+      DOCKER_INFLUXDB_INIT_BUCKET: sensors
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: dev-token
+    volumes:
+      - influxdb-data:/var/lib/influxdb2
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: agri-grafana
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - influxdb
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: agri-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      MOCK_MODE: "false"
+      MQTT_HOST: mosquitto
+      MQTT_PORT: "1883"
+      INFLUX_URL: http://influxdb:8086
+      INFLUX_TOKEN: dev-token
+      INFLUX_ORG: smart-agriculture
+      INFLUX_BUCKET: sensors
+      SECRET_KEY: change-me-in-production
+    depends_on:
+      - mosquitto
+      - influxdb
+
+  gateway:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    container_name: agri-gateway
+    restart: unless-stopped
+    command: ["python", "gateway.py", "--mock", "--mqtt-host", "mosquitto"]
+    # For real hardware, replace the command above with:
+    #   ["python", "gateway.py", "--port", "/dev/ttyUSB0", "--mqtt-host", "mosquitto"]
+    # and uncomment the device mapping below.
+    # devices:
+    #   - "/dev/ttyUSB0:/dev/ttyUSB0"
+    depends_on:
+      - mosquitto
+
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: agri-dashboard
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+
+volumes:
+  mosquitto-data:
+  mosquitto-log:
+  influxdb-data:
+  grafana-data:
