@@ -24,7 +24,7 @@
 #define CMD_PONG 0x84
 
 // Max payload size for a single frame (JSON sensor packet)
-#define MAX_PAYLOAD_LEN 200
+#define MAX_PAYLOAD_LEN 250
 
 uint8_t crc8(const uint8_t *data, size_t len) {
     uint8_t crc = 0x00;

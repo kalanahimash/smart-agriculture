@@ -16,7 +16,7 @@
 #define OLED_ADDRESS 0x3C
 #define OLED_WIDTH 128
 #define OLED_HEIGHT 64
-
+#define INA219_ADDRESS 0x40   // default; change if you've set A0/A1 jumpers
 // ---------- OneWire (DS18B20 soil/water temp) ----------
 #define ONEWIRE_PIN 4
 
@@ -35,10 +35,10 @@
 #define RELAY_PIN 26
 #define RELAY_ACTIVE_LOW true  // most relay modules trigger on LOW
 
-// ---------- RS485 (HW-0519 module) ----------
-#define RS485_RX_PIN 16
-#define RS485_TX_PIN 17
-#define RS485_DE_RE_PIN 27     // driver enable / receiver enable, tied together
+// ---------- RS485 (HW-0519 module, auto-direction variant:
+//            VCC / GND / RXD / TXD / A+ / B- only, no DE/RE pin) ----------
+#define RS485_RX_PIN 16   // ESP32 RX2 <- module TXD
+#define RS485_TX_PIN 17   // ESP32 TX2 -> module RXD
 #define RS485_BAUD 9600
 #define RS485_SLAVE_ID 0x01
 
@@ -47,7 +47,7 @@
 #define DATA_SEND_INTERVAL_MS 5000
 #define OLED_REFRESH_INTERVAL_MS 1000
 #define WATCHDOG_TIMEOUT_S 30
-
+#define OLED_PAGE_INTERVAL_MS 3000   // how long each page stays on screen
 // ---------- Irrigation Thresholds (defaults, overridable via RS485 config msg) ----------
 #define SOIL_MOISTURE_LOW_PCT 30.0f   // below this -> irrigation starts
 #define SOIL_MOISTURE_HIGH_PCT 65.0f  // above this -> irrigation stops

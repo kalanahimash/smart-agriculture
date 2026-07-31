@@ -23,6 +23,7 @@
 #include <Adafruit_BMP280.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <Adafruit_INA219.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <ArduinoJson.h>
@@ -31,12 +32,15 @@
 #include "protocol.h"
 #include "RS485Link.h"
 
+#define TANK_SENSOR_INSTALLED false
+
 // ---------- Peripherals ----------
 Adafruit_BMP280 bmp;
 Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
 OneWire oneWire(ONEWIRE_PIN);
 DallasTemperature soilTempSensor(&oneWire);
-RS485Link rs485(Serial2, RS485_DE_RE_PIN);
+RS485Link rs485(Serial2);
+Adafruit_INA219 ina219(INA219_ADDRESS);
 
 // ---------- State ----------
 struct SensorState {
@@ -48,6 +52,11 @@ struct SensorState {
     bool pumpOn = false;
     bool autoMode = true;
     unsigned long pumpStartedAt = 0;
+    // Pump motor power monitoring (INA219)
+    float pumpBusVoltage = NAN;
+    float pumpLoadVoltage = NAN;
+    float pumpCurrentMa = NAN;
+    float pumpPowerMw = NAN;
 } state;
 
 float thresholdLowPct = SOIL_MOISTURE_LOW_PCT;
@@ -56,7 +65,8 @@ float thresholdHighPct = SOIL_MOISTURE_HIGH_PCT;
 unsigned long lastSensorRead = 0;
 unsigned long lastDataSend = 0;
 unsigned long lastOledRefresh = 0;
-
+uint8_t oledPage = 0;                 // 0=Environment, 1=Water, 2=Power
+unsigned long lastPageFlip = 0;
 // ---------- Forward declarations ----------
 void readSensors();
 void updateIrrigationLogic();
@@ -64,6 +74,10 @@ void setPump(bool on);
 void updateOled();
 void sendSensorReport();
 void handleIncomingRS485();
+void drawEnvironmentPage();
+void drawWaterPage();
+void drawPowerPage();
+void readPumpPower();
 float readSoilMoisturePercent();
 float readTankLevelPercent();
 
@@ -78,9 +92,10 @@ void setup() {
     setPump(false);
 
     // Ultrasonic
+    #if TANK_SENSOR_INSTALLED
     pinMode(HCSR04_TRIG_PIN, OUTPUT);
     pinMode(HCSR04_ECHO_PIN, INPUT);
-
+    #endif
     // I2C bus (BMP280 + OLED)
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
 
@@ -107,7 +122,11 @@ void setup() {
     }
 
     soilTempSensor.begin();
-
+    if (!ina219.begin()) {
+    Serial.println(F("[ERROR] INA219 not found - check wiring"));
+    } else {
+    Serial.println(F("[BOOT] INA219 initialized"));
+    }
     // RS485
     rs485.begin(RS485_BAUD, RS485_RX_PIN, RS485_TX_PIN);
 
@@ -156,6 +175,7 @@ void readSensors() {
 
     state.soilMoisturePct = readSoilMoisturePercent();
     state.tankLevelPct = readTankLevelPercent();
+    readPumpPower();
 }
 
 float readSoilMoisturePercent() {
@@ -165,7 +185,20 @@ float readSoilMoisturePercent() {
     return constrain(pct, 0.0f, 100.0f);
 }
 
+void readPumpPower() {
+    float shuntVoltage = ina219.getShuntVoltage_mV();
+    state.pumpBusVoltage = ina219.getBusVoltage_V();
+    state.pumpCurrentMa = ina219.getCurrent_mA();
+    state.pumpPowerMw = ina219.getPower_mW();
+    // Load voltage = bus voltage + shunt voltage drop, matching your original code
+    state.pumpLoadVoltage = state.pumpBusVoltage + (shuntVoltage / 1000.0f);
+}
+
+
 float readTankLevelPercent() {
+#if !TANK_SENSOR_INSTALLED
+    return 100.0f;
+#else
     digitalWrite(HCSR04_TRIG_PIN, LOW);
     delayMicroseconds(2);
     digitalWrite(HCSR04_TRIG_PIN, HIGH);
@@ -179,6 +212,7 @@ float readTankLevelPercent() {
     float waterDepthCm = TANK_HEIGHT_CM - (distanceCm - TANK_SENSOR_OFFSET_CM);
     float pct = (waterDepthCm / TANK_HEIGHT_CM) * 100.0f;
     return constrain(pct, 0.0f, 100.0f);
+#endif
 }
 
 void updateIrrigationLogic() {
@@ -209,26 +243,94 @@ void setPump(bool on) {
 }
 
 void updateOled() {
+    unsigned long now = millis();
+    if (now - lastPageFlip >= OLED_PAGE_INTERVAL_MS) {
+        lastPageFlip = now;
+        oledPage = (oledPage + 1) % 3;
+    }
+
     display.clearDisplay();
-    display.setCursor(0, 0);
     display.setTextSize(1);
-    display.println(F("Smart Agri Node"));
-    display.print(F("Air: "));
-    display.print(isnan(state.airTempC) ? -1 : state.airTempC, 1);
-    display.println(F(" C"));
-    display.print(F("Soil M: "));
-    display.print(isnan(state.soilMoisturePct) ? -1 : state.soilMoisturePct, 0);
-    display.println(F(" %"));
-    display.print(F("Tank: "));
-    display.print(isnan(state.tankLevelPct) ? -1 : state.tankLevelPct, 0);
-    display.println(F(" %"));
-    display.print(F("Pump: "));
-    display.println(state.pumpOn ? F("ON") : F("OFF"));
+    display.setCursor(0, 0);
+
+    switch (oledPage) {
+        case 0: drawEnvironmentPage(); break;
+        case 1: drawWaterPage();       break;
+        case 2: drawPowerPage();       break;
+    }
+
     display.display();
 }
 
+void drawEnvironmentPage() {
+    display.println(F("-- ENVIRONMENT --"));
+
+    display.setCursor(0, 16);
+    display.print(F("Air Temp: "));
+    display.print(isnan(state.airTempC) ? 0 : state.airTempC, 1);
+    display.println(F(" C"));
+
+    display.setCursor(0, 28);
+    display.print(F("Pressure: "));
+    display.print(isnan(state.pressureHPa) ? 0 : state.pressureHPa, 0);
+    display.println(F(" hPa"));
+
+    display.setCursor(0, 40);
+    display.print(F("Soil Moist: "));
+    display.print(isnan(state.soilMoisturePct) ? 0 : state.soilMoisturePct, 0);
+    display.println(F(" %"));
+
+    display.setCursor(0, 52);
+    display.print(F("Soil Temp: "));
+    display.print(isnan(state.soilTempC) ? 0 : state.soilTempC, 1);
+    display.println(F(" C"));
+}
+
+void drawWaterPage() {
+    display.println(F("-- WATER --"));
+
+    display.setCursor(0, 20);
+    display.setTextSize(2);
+    display.print(F("Tank:"));
+    display.print(isnan(state.tankLevelPct) ? 0 : state.tankLevelPct, 0);
+    display.println(F("%"));
+
+    display.setTextSize(1);
+    display.setCursor(0, 44);
+    display.print(F("Pump: "));
+    display.println(state.pumpOn ? F("ON") : F("OFF"));
+
+    display.setCursor(0, 54);
+    display.print(F("Mode: "));
+    display.println(state.autoMode ? F("AUTO") : F("MANUAL"));
+}
+
+void drawPowerPage() {
+    display.println(F("-- PUMP POWER --"));
+
+    display.setCursor(0, 16);
+    display.print(F("Bus : "));
+    display.print(isnan(state.pumpBusVoltage) ? 0 : state.pumpBusVoltage, 2);
+    display.println(F(" V"));
+
+    display.setCursor(0, 28);
+    display.print(F("Load: "));
+    display.print(isnan(state.pumpLoadVoltage) ? 0 : state.pumpLoadVoltage, 2);
+    display.println(F(" V"));
+
+    display.setCursor(0, 40);
+    display.print(F("Curr: "));
+    display.print(isnan(state.pumpCurrentMa) ? 0 : state.pumpCurrentMa, 0);
+    display.println(F(" mA"));
+
+    display.setCursor(0, 52);
+    display.print(F("Pwr : "));
+    display.print(isnan(state.pumpPowerMw) ? 0 : state.pumpPowerMw, 0);
+    display.println(F(" mW"));
+}
+
 void sendSensorReport() {
-    StaticJsonDocument<192> doc;
+    StaticJsonDocument<256> doc;   // bumped from 192 - more fields now
     doc["node"] = NODE_ID;
     doc["air_temp_c"] = state.airTempC;
     doc["pressure_hpa"] = state.pressureHPa;
@@ -237,6 +339,10 @@ void sendSensorReport() {
     doc["tank_level_pct"] = state.tankLevelPct;
     doc["pump_on"] = state.pumpOn;
     doc["auto_mode"] = state.autoMode;
+    doc["pump_bus_voltage"] = state.pumpBusVoltage;
+    doc["pump_load_voltage"] = state.pumpLoadVoltage;
+    doc["pump_current_ma"] = state.pumpCurrentMa;
+    doc["pump_power_mw"] = state.pumpPowerMw;
     doc["uptime_s"] = millis() / 1000;
 
     char buf[MAX_PAYLOAD_LEN];

@@ -17,9 +17,15 @@ Pin assignments match `firmware/include/config.h` — change both together if yo
 | HC-SR04 Trig             | GPIO 5    | |
 | HC-SR04 Echo             | GPIO 18   | Use a voltage divider (Echo is 5V, ESP32 is 3.3V-tolerant only!) |
 | Relay Signal             | GPIO 26   | Active-LOW on most cheap relay boards — see `RELAY_ACTIVE_LOW` in config.h |
-| RS485 RX (module RO)     | GPIO 16   | |
-| RS485 TX (module DI)     | GPIO 17   | |
-| RS485 DE/RE              | GPIO 27   | Tie DE and RE together on the HW-0519 module |
+| RS485 module RXD          | GPIO 17   | Crossed: module's RXD listens to ESP32's TX2 |
+| RS485 module TXD          | GPIO 16   | Crossed: module's TXD feeds ESP32's RX2 |
+
+> **Note:** This project uses the auto-direction variant of the HW-0519 (only
+> VCC/GND/RXD/TXD/A+/B- exposed — no separate DE/RE pins). The onboard chip
+> switches transmit/receive automatically, so no extra GPIO or logic is needed
+> for direction control. If you have a variant that *does* expose DE/RE pins,
+> see the commented-out alternate implementation at the bottom of
+> `firmware/include/RS485Link.h`.
 
 ## Power
 
