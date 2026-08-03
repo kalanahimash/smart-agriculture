@@ -5,6 +5,9 @@ Frame: [START][SLAVE_ID][CMD][LEN][PAYLOAD...][CRC8][END]
 START = 0xAA, END = 0x55
 """
 from dataclasses import dataclass
+import logging
+
+log = logging.getLogger("protocol")
 
 FRAME_START = 0xAA
 FRAME_END = 0x55
@@ -22,7 +25,7 @@ CMD_ACK = 0x82
 CMD_NACK = 0x83
 CMD_PONG = 0x84
 
-MAX_PAYLOAD_LEN = 200
+MAX_PAYLOAD_LEN = 250
 
 
 def crc8(data: bytes) -> int:
@@ -92,8 +95,12 @@ class FrameParser:
 
             if end_byte == FRAME_END and crc_calc == crc_received:
                 frames.append(Frame(slave_id=slave_id, cmd=cmd, payload=payload))
-            # else: corrupted frame, drop it silently
-
-            del self._buf[:frame_total_len]
+                del self._buf[:frame_total_len]
+            else:
+                if crc_calc != crc_received:
+                    log.warning("CRC validation failed for frame (calculated 0x%02X, received 0x%02X)", crc_calc, crc_received)
+                elif end_byte != FRAME_END:
+                    log.warning("Invalid END byte for frame (expected 0x%02X, got 0x%02X)", FRAME_END, end_byte)
+                del self._buf[:1]
 
         return frames

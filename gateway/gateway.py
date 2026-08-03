@@ -25,7 +25,7 @@ import paho.mqtt.client as mqtt
 
 from protocol import (
     FrameParser, build_frame,
-    CMD_DATA_REPORT, CMD_SET_PUMP, CMD_SET_MODE, CMD_SET_THRESHOLDS, CMD_PING,
+    CMD_DATA_REPORT, CMD_POLL_DATA, CMD_SET_PUMP, CMD_SET_MODE, CMD_SET_THRESHOLDS, CMD_PING,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -38,6 +38,22 @@ MQTT_TOPIC_CMD_MODE = "farm/{node}/cmd/mode"
 MQTT_TOPIC_CMD_THRESHOLDS = "farm/{node}/cmd/thresholds"
 
 DEFAULT_SLAVE_ID = 0x01
+
+KEY_MAP = {
+    "id": "node",
+    "at": "air_temp_c",
+    "pr": "pressure_hpa",
+    "st": "soil_temp_c",
+    "sm": "soil_moisture_pct",
+    "tl": "tank_level_pct",
+    "po": "pump_on",
+    "am": "auto_mode",
+    "bv": "pump_bus_voltage",
+    "lv": "pump_load_voltage",
+    "cm": "pump_current_ma",
+    "pw": "pump_power_mw",
+    "up": "uptime_s",
+}
 
 
 class SerialRS485Backend:
@@ -76,15 +92,15 @@ class MockRS485Backend:
             self._tank = max(0, self._tank - 0.5)
 
         payload = json.dumps({
-            "node": "esp32-node-01",
-            "air_temp_c": round(24 + random.uniform(-2, 3), 1),
-            "pressure_hpa": round(1012 + random.uniform(-3, 3), 1),
-            "soil_temp_c": round(21 + random.uniform(-1, 1), 1),
-            "soil_moisture_pct": round(self._soil, 1),
-            "tank_level_pct": round(self._tank, 1),
-            "pump_on": self._pump_on,
-            "auto_mode": True,
-            "uptime_s": int(time.time()),
+            "id": "esp32-node-01",
+            "at": round(24 + random.uniform(-2, 3), 1),
+            "pr": round(1012 + random.uniform(-3, 3), 1),
+            "st": round(21 + random.uniform(-1, 1), 1),
+            "sm": round(self._soil, 1),
+            "tl": round(self._tank, 1),
+            "po": self._pump_on,
+            "am": True,
+            "up": int(time.time()),
         }).encode()
 
         from protocol import Frame
@@ -101,10 +117,19 @@ class Gateway:
     def __init__(self, backend, mqtt_host: str, mqtt_port: int, poll_interval: float):
         self.backend = backend
         self.poll_interval = poll_interval
-        self.mqtt_client = mqtt.Client(client_id="smart-agri-gateway")
+
+        try:
+            self.mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, client_id="smart-agri-gateway")
+        except (AttributeError, TypeError):
+            self.mqtt_client = mqtt.Client(client_id="smart-agri-gateway")
+
         self.mqtt_client.on_connect = self._on_connect
         self.mqtt_client.connect(mqtt_host, mqtt_port, keepalive=30)
         self.mqtt_client.loop_start()
+
+        self._last_frame_time = 0.0
+        self._is_online = False
+        self._last_node = f"node-{DEFAULT_SLAVE_ID}"
 
     def _on_connect(self, client, userdata, flags, rc):
         log.info("Connected to MQTT broker (rc=%s)", rc)
@@ -140,14 +165,25 @@ class Gateway:
             self.backend.send(frame)
             log.info("Forwarded thresholds: low=%.1f high=%.1f", low, high)
 
+    def _check_connectivity(self):
+        if self._is_online and (time.time() - self._last_frame_time >= 30.0):
+            self._is_online = False
+            topic = MQTT_TOPIC_STATUS.format(node=self._last_node)
+            self.mqtt_client.publish(topic, json.dumps({"online": False}), qos=1)
+            log.warning("Node %s is offline (no frame for 30s)", self._last_node)
+
     def run(self):
         log.info("Gateway running, polling every %.1fs", self.poll_interval)
         while True:
+            self.backend.send(build_frame(DEFAULT_SLAVE_ID, CMD_POLL_DATA))
             for frame in self.backend.read_frames():
                 self._handle_frame(frame)
+            self._check_connectivity()
             time.sleep(self.poll_interval)
 
     def _handle_frame(self, frame):
+        self._last_frame_time = time.time()
+
         if frame.cmd == CMD_DATA_REPORT:
             try:
                 data = json.loads(frame.payload.decode())
@@ -155,13 +191,29 @@ class Gateway:
                 log.warning("Malformed sensor report, dropping")
                 return
 
-            node = data.get("node", f"node-{frame.slave_id}")
-            data["timestamp"] = datetime.now(timezone.utc).isoformat()
+            expanded = {KEY_MAP.get(k, k): v for k, v in data.items()}
+            node = expanded.get("node", f"node-{frame.slave_id}")
+            self._last_node = node
+
+            if not self._is_online:
+                self._is_online = True
+                status_topic = MQTT_TOPIC_STATUS.format(node=node)
+                self.mqtt_client.publish(status_topic, json.dumps({"online": True}), qos=1)
+                log.info("Node %s is online", node)
+
+            expanded["timestamp"] = datetime.now(timezone.utc).isoformat()
 
             topic = MQTT_TOPIC_SENSOR.format(node=node)
-            self.mqtt_client.publish(topic, json.dumps(data), qos=0)
-            log.debug("Published to %s: %s", topic, data)
+            self.mqtt_client.publish(topic, json.dumps(expanded), qos=1)
+            log.debug("Published to %s: %s", topic, expanded)
         else:
+            node = f"node-{frame.slave_id}"
+            self._last_node = node
+            if not self._is_online:
+                self._is_online = True
+                status_topic = MQTT_TOPIC_STATUS.format(node=node)
+                self.mqtt_client.publish(status_topic, json.dumps({"online": True}), qos=1)
+                log.info("Node %s is online", node)
             log.debug("Received non-data frame cmd=0x%02X", frame.cmd)
 
 
@@ -171,7 +223,7 @@ def main():
     parser.add_argument("--baud", type=int, default=9600)
     parser.add_argument("--mqtt-host", default="localhost")
     parser.add_argument("--mqtt-port", type=int, default=1883)
-    parser.add_argument("--poll-interval", type=float, default=1.0)
+    parser.add_argument("--poll-interval", type=float, default=0.2)
     parser.add_argument("--mock", action="store_true", help="Use simulated sensor data instead of real hardware")
     args = parser.parse_args()
 
@@ -193,3 +245,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

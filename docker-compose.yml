@@ -83,12 +83,9 @@ services:
       dockerfile: Dockerfile
     container_name: agri-gateway
     restart: unless-stopped
-    command: ["python", "gateway.py", "--mock", "--mqtt-host", "mosquitto"]
-    # For real hardware, replace the command above with:
-    #   ["python", "gateway.py", "--port", "/dev/ttyUSB0", "--mqtt-host", "mosquitto"]
-    # and uncomment the device mapping below.
-    # devices:
-    #   - "/dev/ttyUSB0:/dev/ttyUSB0"
+    command: ["python", "gateway.py", "--port", "/dev/ttyS0", "--mqtt-host", "mosquitto"]
+    devices:
+       - "/dev/ttyS0:/dev/ttyS0"
     depends_on:
       - mosquitto
 
