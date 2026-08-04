@@ -27,6 +27,7 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <ArduinoJson.h>
+#include <esp_task_wdt.h>
 
 #include "config.h"
 #include "protocol.h"
@@ -122,18 +123,26 @@ void setup() {
     }
 
     soilTempSensor.begin();
+    soilTempSensor.setWaitForConversion(false);  // non-blocking DS18B20 reads
+
     if (!ina219.begin()) {
-    Serial.println(F("[ERROR] INA219 not found - check wiring"));
+        Serial.println(F("[ERROR] INA219 not found - check wiring"));
     } else {
-    Serial.println(F("[BOOT] INA219 initialized"));
+        Serial.println(F("[BOOT] INA219 initialized"));
     }
+
     // RS485
     rs485.begin(RS485_BAUD, RS485_RX_PIN, RS485_TX_PIN);
+
+    // Hardware watchdog — resets ESP32 if loop() stalls
+    esp_task_wdt_init(WATCHDOG_TIMEOUT_S, true);
+    esp_task_wdt_add(NULL);
 
     Serial.println(F("[BOOT] Setup complete."));
 }
 
 void loop() {
+    esp_task_wdt_reset();
     unsigned long now = millis();
 
     if (now - lastSensorRead >= SENSOR_READ_INTERVAL_MS) {
@@ -162,14 +171,19 @@ void loop() {
 }
 
 void readSensors() {
-    if (!isnan(bmp.readTemperature())) {
-        state.airTempC = bmp.readTemperature();
+    // Read BMP280 once — avoid double I2C transaction
+    float airT = bmp.readTemperature();
+    if (!isnan(airT)) {
+        state.airTempC = airT;
         state.pressureHPa = bmp.readPressure() / 100.0f;
     }
 
+    // DS18B20: requestTemperatures() returns immediately (non-blocking).
+    // getTempCByIndex() returns the PREVIOUS conversion result.
+    // Filter out 85.0 °C which is the DS18B20 power-on reset value.
     soilTempSensor.requestTemperatures();
     float t = soilTempSensor.getTempCByIndex(0);
-    if (t != DEVICE_DISCONNECTED_C) {
+    if (t != DEVICE_DISCONNECTED_C && t != 85.0f) {
         state.soilTempC = t;
     }
 
@@ -330,24 +344,36 @@ void drawPowerPage() {
 }
 
 void sendSensorReport() {
-    StaticJsonDocument<256> doc;   // bumped from 192 - more fields now
-    doc["node"] = NODE_ID;
-    doc["air_temp_c"] = state.airTempC;
-    doc["pressure_hpa"] = state.pressureHPa;
-    doc["soil_temp_c"] = state.soilTempC;
-    doc["soil_moisture_pct"] = state.soilMoisturePct;
-    doc["tank_level_pct"] = state.tankLevelPct;
-    doc["pump_on"] = state.pumpOn;
-    doc["auto_mode"] = state.autoMode;
-    doc["pump_bus_voltage"] = state.pumpBusVoltage;
-    doc["pump_load_voltage"] = state.pumpLoadVoltage;
-    doc["pump_current_ma"] = state.pumpCurrentMa;
-    doc["pump_power_mw"] = state.pumpPowerMw;
-    doc["uptime_s"] = millis() / 1000;
+    // Shortened keys keep payload well under 250 bytes (protocol LEN is uint8_t).
+    // Key map sent to gateway:
+    //   id=node  at=air_temp_c  pr=pressure_hpa  st=soil_temp_c
+    //   sm=soil_moisture_pct  tl=tank_level_pct  po=pump_on  am=auto_mode
+    //   bv=pump_bus_voltage  lv=pump_load_voltage  cm=pump_current_ma
+    //   pw=pump_power_mw  up=uptime_s
+    StaticJsonDocument<384> doc;
+    doc["id"] = NODE_ID;
+    if (!isnan(state.airTempC))        doc["at"] = state.airTempC;
+    if (!isnan(state.pressureHPa))     doc["pr"] = state.pressureHPa;
+    if (!isnan(state.soilTempC))       doc["st"] = state.soilTempC;
+    if (!isnan(state.soilMoisturePct)) doc["sm"] = state.soilMoisturePct;
+    if (!isnan(state.tankLevelPct))    doc["tl"] = state.tankLevelPct;
+    doc["po"] = state.pumpOn;
+    doc["am"] = state.autoMode;
+    if (!isnan(state.pumpBusVoltage))  doc["bv"] = state.pumpBusVoltage;
+    if (!isnan(state.pumpLoadVoltage)) doc["lv"] = state.pumpLoadVoltage;
+    if (!isnan(state.pumpCurrentMa))   doc["cm"] = state.pumpCurrentMa;
+    if (!isnan(state.pumpPowerMw))     doc["pw"] = state.pumpPowerMw;
+    doc["up"] = millis() / 1000;
 
     char buf[MAX_PAYLOAD_LEN];
     size_t len = serializeJson(doc, buf, sizeof(buf));
 
+    if (len == 0 || len >= sizeof(buf)) {
+        Serial.println(F("[RS485] ERROR: JSON too large or serialization failed"));
+        return;
+    }
+
+    Serial.printf("[RS485] TX report: %u bytes\n", (unsigned)len);
     rs485.sendFrame(CMD_DATA_REPORT, (const uint8_t *)buf, (uint8_t)len);
 }
 
@@ -382,9 +408,22 @@ void handleIncomingRS485() {
         }
         case CMD_SET_THRESHOLDS: {
             if (len >= sizeof(float) * 2) {
-                memcpy(&thresholdLowPct, payload, sizeof(float));
-                memcpy(&thresholdHighPct, payload + sizeof(float), sizeof(float));
-                rs485.sendFrame(CMD_ACK, nullptr, 0);
+                float newLow, newHigh;
+                memcpy(&newLow, payload, sizeof(float));
+                memcpy(&newHigh, payload + sizeof(float), sizeof(float));
+                // Validate: sane percentages, low < high, no NaN/Inf
+                if (!isnan(newLow) && !isnan(newHigh) &&
+                    newLow >= 0.0f && newLow <= 100.0f &&
+                    newHigh >= 0.0f && newHigh <= 100.0f &&
+                    newLow < newHigh) {
+                    thresholdLowPct = newLow;
+                    thresholdHighPct = newHigh;
+                    rs485.sendFrame(CMD_ACK, nullptr, 0);
+                    Serial.printf("[RS485] Thresholds: low=%.1f high=%.1f\n", newLow, newHigh);
+                } else {
+                    rs485.sendFrame(CMD_NACK, nullptr, 0);
+                    Serial.println(F("[RS485] Invalid threshold values, NACK"));
+                }
             }
             break;
         }

@@ -5,6 +5,10 @@
 //  RS485 Wire Protocol
 //  Frame: [START][SLAVE_ID][CMD][LEN][PAYLOAD...][CRC8][END]
 //  START = 0xAA, END = 0x55
+//
+//  CRC8 is computed over [SLAVE_ID][CMD][LEN][PAYLOAD] ONLY.
+//  START and END bytes are NOT included in the CRC calculation.
+//  This scope must match exactly on both ESP32 and Raspberry Pi.
 // ============================================================
 
 #define FRAME_START 0xAA
@@ -23,10 +27,12 @@
 #define CMD_NACK 0x83
 #define CMD_PONG 0x84
 
-// Max payload size for a single frame (JSON sensor packet)
+// Max payload size for a single frame (protocol LEN field is uint8_t → max 255)
 #define MAX_PAYLOAD_LEN 250
 
-uint8_t crc8(const uint8_t *data, size_t len) {
+// CRC-8 (polynomial 0x07, init 0x00)
+// Must be inline — this header is included from multiple translation units.
+inline uint8_t crc8(const uint8_t *data, size_t len) {
     uint8_t crc = 0x00;
     for (size_t i = 0; i < len; i++) {
         crc ^= data[i];
